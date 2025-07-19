@@ -6,13 +6,22 @@
 (define-constant ERR_VOTING_CLOSED (err u104))
 (define-constant ERR_INSUFFICIENT_STAKE (err u105))
 (define-constant ERR_ALREADY_CLAIMED (err u106))
+(define-constant ERR_ZONE_NOT_FOUND (err u107))
+(define-constant ERR_ALERT_ALREADY_SET (err u108))
+(define-constant ERR_INVALID_COORDINATES (err u109))
+(define-constant ERR_INVALID_RISK_LEVEL (err u110))
 
 (define-constant MIN_STAKE u1000000)
 (define-constant VOTING_PERIOD u144)
 (define-constant CONSENSUS_THRESHOLD u66)
 (define-constant REWARD_AMOUNT u500000)
+(define-constant RISK_CALCULATION_WINDOW u1008)
+(define-constant HIGH_RISK_THRESHOLD u70)
+(define-constant CRITICAL_RISK_THRESHOLD u90)
+(define-constant ZONE_ALERT_REWARD u250000)
 
 (define-data-var next-report-id uint u1)
+(define-data-var next-zone-id uint u1)
 (define-data-var total-reports uint u0)
 (define-data-var total-validated-reports uint u0)
 
@@ -52,6 +61,49 @@
 (define-map validator-rewards
   { report-id: uint, validator: principal }
   { amount: uint, claimed: bool }
+)
+
+(define-map pollution-zones
+  uint
+  {
+    zone-name: (string-ascii 100),
+    latitude: int,
+    longitude: int,
+    radius: uint,
+    creator: principal,
+    creation-time: uint,
+    total-reports: uint,
+    validated-reports: uint,
+    risk-level: uint,
+    last-updated: uint,
+    alert-active: bool
+  }
+)
+
+(define-map zone-reports
+  { zone-id: uint, report-id: uint }
+  bool
+)
+
+(define-map zone-alerts
+  { zone-id: uint, alert-type: (string-ascii 20) }
+  {
+    creator: principal,
+    creation-time: uint,
+    expiry-time: uint,
+    active: bool,
+    reward-claimed: bool
+  }
+)
+
+(define-map zone-subscribers
+  { zone-id: uint, subscriber: principal }
+  { subscribed-at: uint, notifications-enabled: bool }
+)
+
+(define-map zone-risk-history
+  { zone-id: uint, block-height: uint }
+  { risk-level: uint, report-count: uint }
 )
 
 (define-public (stake-tokens (amount uint))
@@ -262,6 +314,213 @@
       )
       false
     )
+  )
+)
+
+(define-public (create-pollution-zone 
+  (zone-name (string-ascii 100))
+  (latitude int)
+  (longitude int)
+  (radius uint)
+)
+  (let (
+    (zone-id (var-get next-zone-id))
+    (current-block stacks-block-height)
+  )
+    (asserts! (and (>= latitude -90000000) (<= latitude 90000000)) ERR_INVALID_COORDINATES)
+    (asserts! (and (>= longitude -180000000) (<= longitude 180000000)) ERR_INVALID_COORDINATES)
+    (asserts! (and (>= radius u100) (<= radius u50000)) ERR_INVALID_COORDINATES)
+    
+    (map-set pollution-zones zone-id {
+      zone-name: zone-name,
+      latitude: latitude,
+      longitude: longitude,
+      radius: radius,
+      creator: tx-sender,
+      creation-time: current-block,
+      total-reports: u0,
+      validated-reports: u0,
+      risk-level: u0,
+      last-updated: current-block,
+      alert-active: false
+    })
+    
+    (var-set next-zone-id (+ zone-id u1))
+    (ok zone-id)
+  )
+)
+
+(define-public (subscribe-to-zone (zone-id uint))
+  (let (
+    (zone (unwrap! (map-get? pollution-zones zone-id) ERR_ZONE_NOT_FOUND))
+    (current-block stacks-block-height)
+  )
+    (map-set zone-subscribers 
+      { zone-id: zone-id, subscriber: tx-sender }
+      { subscribed-at: current-block, notifications-enabled: true }
+    )
+    (ok true)
+  )
+)
+
+(define-public (unsubscribe-from-zone (zone-id uint))
+  (let (
+    (zone (unwrap! (map-get? pollution-zones zone-id) ERR_ZONE_NOT_FOUND))
+  )
+    (map-delete zone-subscribers { zone-id: zone-id, subscriber: tx-sender })
+    (ok true)
+  )
+)
+
+(define-public (link-report-to-zone (report-id uint) (zone-id uint))
+  (let (
+    (report (unwrap! (map-get? pollution-reports report-id) ERR_REPORT_NOT_FOUND))
+    (zone (unwrap! (map-get? pollution-zones zone-id) ERR_ZONE_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get reporter report)) ERR_NOT_AUTHORIZED)
+    
+    (map-set zone-reports { zone-id: zone-id, report-id: report-id } true)
+    (update-zone-statistics zone-id report-id)
+    (ok true)
+  )
+)
+
+(define-public (create-zone-alert 
+  (zone-id uint)
+  (alert-type (string-ascii 20))
+  (duration uint)
+)
+  (let (
+    (zone (unwrap! (map-get? pollution-zones zone-id) ERR_ZONE_NOT_FOUND))
+    (current-block stacks-block-height)
+    (alert-key { zone-id: zone-id, alert-type: alert-type })
+    (existing-alert (map-get? zone-alerts alert-key))
+  )
+    (asserts! (>= (get risk-level zone) HIGH_RISK_THRESHOLD) ERR_INVALID_RISK_LEVEL)
+    (asserts! (is-none existing-alert) ERR_ALERT_ALREADY_SET)
+    (asserts! (and (>= duration u144) (<= duration u1008)) ERR_INVALID_REPORT)
+    
+    (map-set zone-alerts alert-key {
+      creator: tx-sender,
+      creation-time: current-block,
+      expiry-time: (+ current-block duration),
+      active: true,
+      reward-claimed: false
+    })
+    
+    (map-set pollution-zones zone-id (merge zone { alert-active: true }))
+    (ok true)
+  )
+)
+
+(define-public (claim-zone-alert-reward (zone-id uint) (alert-type (string-ascii 20)))
+  (let (
+    (alert-key { zone-id: zone-id, alert-type: alert-type })
+    (alert (unwrap! (map-get? zone-alerts alert-key) ERR_REPORT_NOT_FOUND))
+    (zone (unwrap! (map-get? pollution-zones zone-id) ERR_ZONE_NOT_FOUND))
+    (current-block stacks-block-height)
+  )
+    (asserts! (is-eq tx-sender (get creator alert)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get reward-claimed alert)) ERR_ALREADY_CLAIMED)
+    (asserts! (>= current-block (get expiry-time alert)) ERR_VOTING_CLOSED)
+    (asserts! (>= (get risk-level zone) HIGH_RISK_THRESHOLD) ERR_INVALID_RISK_LEVEL)
+    
+    (try! (as-contract (stx-transfer? ZONE_ALERT_REWARD tx-sender tx-sender)))
+    (map-set zone-alerts alert-key (merge alert { reward-claimed: true }))
+    (ok ZONE_ALERT_REWARD)
+  )
+)
+
+(define-public (update-zone-risk-level (zone-id uint))
+  (let (
+    (zone (unwrap! (map-get? pollution-zones zone-id) ERR_ZONE_NOT_FOUND))
+    (current-block stacks-block-height)
+    (risk-calculation (calculate-zone-risk zone-id))
+  )
+    (map-set pollution-zones zone-id (merge zone {
+      risk-level: risk-calculation,
+      last-updated: current-block
+    }))
+    
+    (map-set zone-risk-history 
+      { zone-id: zone-id, block-height: current-block }
+      { risk-level: risk-calculation, report-count: (get total-reports zone) }
+    )
+    
+    (ok risk-calculation)
+  )
+)
+
+(define-private (update-zone-statistics (zone-id uint) (report-id uint))
+  (match (map-get? pollution-zones zone-id)
+    some-zone (match (map-get? pollution-reports report-id)
+      some-report (let (
+        (current-block stacks-block-height)
+        (new-total-reports (+ (get total-reports some-zone) u1))
+        (new-validated-reports (if (get validated some-report) 
+                                 (+ (get validated-reports some-zone) u1) 
+                                 (get validated-reports some-zone)))
+      )
+        (map-set pollution-zones zone-id (merge some-zone {
+          total-reports: new-total-reports,
+          validated-reports: new-validated-reports,
+          last-updated: current-block
+        }))
+        true
+      )
+      false
+    )
+    false
+  )
+)
+
+(define-private (calculate-zone-risk (zone-id uint))
+  (let (
+    (zone (unwrap! (map-get? pollution-zones zone-id) u0))
+    (zone-total-reports (get total-reports zone))
+    (zone-validated-reports (get validated-reports zone))
+  )
+    (if (is-eq zone-total-reports u0)
+      u0
+      (let (
+        (validation-rate (* (/ zone-validated-reports zone-total-reports) u100))
+        (report-density (if (<= zone-total-reports u10) zone-total-reports u10))
+        (base-risk (* validation-rate report-density))
+      )
+        (if (<= base-risk u100) base-risk u100)
+      )
+    )
+  )
+)
+
+(define-read-only (get-zone (zone-id uint))
+  (map-get? pollution-zones zone-id)
+)
+
+(define-read-only (get-zone-alerts (zone-id uint) (alert-type (string-ascii 20)))
+  (map-get? zone-alerts { zone-id: zone-id, alert-type: alert-type })
+)
+
+(define-read-only (get-zone-subscription (zone-id uint) (subscriber principal))
+  (map-get? zone-subscribers { zone-id: zone-id, subscriber: subscriber })
+)
+
+(define-read-only (is-report-in-zone (zone-id uint) (report-id uint))
+  (default-to false (map-get? zone-reports { zone-id: zone-id, report-id: report-id }))
+)
+
+(define-read-only (get-zone-risk-history (zone-id uint) (target-block uint))
+  (map-get? zone-risk-history { zone-id: zone-id, block-height: target-block })
+)
+
+(define-read-only (get-zone-count)
+  (var-get next-zone-id)
+)
+
+(define-read-only (is-zone-high-risk (zone-id uint))
+  (match (map-get? pollution-zones zone-id)
+    some-zone (>= (get risk-level some-zone) HIGH_RISK_THRESHOLD)
+    false
   )
 )
 
