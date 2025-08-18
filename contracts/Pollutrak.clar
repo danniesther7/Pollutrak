@@ -10,6 +10,11 @@
 (define-constant ERR_ALERT_ALREADY_SET (err u108))
 (define-constant ERR_INVALID_COORDINATES (err u109))
 (define-constant ERR_INVALID_RISK_LEVEL (err u110))
+(define-constant ERR_SOURCE_NOT_FOUND (err u111))
+(define-constant ERR_SOURCE_ALREADY_REGISTERED (err u112))
+(define-constant ERR_INVALID_EMISSION_DATA (err u113))
+(define-constant ERR_COMPLIANCE_PERIOD_ACTIVE (err u114))
+(define-constant ERR_INSUFFICIENT_DEPOSIT (err u115))
 
 (define-constant MIN_STAKE u1000000)
 (define-constant VOTING_PERIOD u144)
@@ -19,8 +24,14 @@
 (define-constant HIGH_RISK_THRESHOLD u70)
 (define-constant CRITICAL_RISK_THRESHOLD u90)
 (define-constant ZONE_ALERT_REWARD u250000)
+(define-constant SOURCE_REGISTRATION_DEPOSIT u2000000)
+(define-constant COMPLIANCE_PERIOD u720)
+(define-constant EMISSION_PENALTY_RATE u100000)
+(define-constant COMPLIANCE_REWARD u750000)
+(define-constant COMMUNITY_REPORT_REWARD u150000)
 
 (define-data-var next-report-id uint u1)
+(define-data-var next-source-id uint u1)
 (define-data-var next-zone-id uint u1)
 (define-data-var total-reports uint u0)
 (define-data-var total-validated-reports uint u0)
@@ -523,4 +534,304 @@
     false
   )
 )
+
+(define-map pollution-sources
+  uint
+  {
+    source-name: (string-ascii 100),
+    owner: principal,
+    source-type: (string-ascii 50),
+    location: (string-ascii 100),
+    registration-time: uint,
+    deposit-amount: uint,
+    active: bool,
+    compliance-score: uint,
+    total-emissions: uint,
+    last-report-time: uint
+  }
+)
+
+(define-map source-emissions
+  { source-id: uint, period: uint }
+  {
+    emission-amount: uint,
+    emission-type: (string-ascii 50),
+    reported-by: principal,
+    report-time: uint,
+    verified: bool,
+    exceeds-limit: bool
+  }
+)
+
+(define-map compliance-records
+  { source-id: uint, period: uint }
+  {
+    compliance-status: bool,
+    penalty-amount: uint,
+    reward-amount: uint,
+    assessment-time: uint,
+    assessed-by: principal
+  }
+)
+
+(define-map source-community-reports
+  uint
+  {
+    source-id: uint,
+    reporter: principal,
+    report-type: (string-ascii 50),
+    description: (string-ascii 300),
+    severity: uint,
+    report-time: uint,
+    verified: bool,
+    reward-claimed: bool
+  }
+)
+
+(define-map source-deposits
+  principal
+  uint
+)
+
+(define-public (register-pollution-source 
+  (source-name (string-ascii 100))
+  (source-type (string-ascii 50))
+  (location (string-ascii 100))
+)
+  (let (
+    (source-id (var-get next-source-id))
+    (current-block stacks-block-height)
+    (existing-source (map-get? pollution-sources source-id))
+  )
+    (asserts! (is-none existing-source) ERR_SOURCE_ALREADY_REGISTERED)
+    (asserts! (>= (len source-name) u3) ERR_INVALID_EMISSION_DATA)
+    
+    (try! (stx-transfer? SOURCE_REGISTRATION_DEPOSIT tx-sender (as-contract tx-sender)))
+    
+    (map-set pollution-sources source-id {
+      source-name: source-name,
+      owner: tx-sender,
+      source-type: source-type,
+      location: location,
+      registration-time: current-block,
+      deposit-amount: SOURCE_REGISTRATION_DEPOSIT,
+      active: true,
+      compliance-score: u100,
+      total-emissions: u0,
+      last-report-time: u0
+    })
+    
+    (map-set source-deposits tx-sender SOURCE_REGISTRATION_DEPOSIT)
+    (var-set next-source-id (+ source-id u1))
+    (ok source-id)
+  )
+)
+
+(define-public (report-emissions 
+  (source-id uint)
+  (emission-amount uint)
+  (emission-type (string-ascii 50))
+  (period uint)
+)
+  (let (
+    (source (unwrap! (map-get? pollution-sources source-id) ERR_SOURCE_NOT_FOUND))
+    (current-block stacks-block-height)
+    (emission-key { source-id: source-id, period: period })
+    (existing-emission (map-get? source-emissions emission-key))
+  )
+    (asserts! (is-eq tx-sender (get owner source)) ERR_NOT_AUTHORIZED)
+    (asserts! (get active source) ERR_SOURCE_NOT_FOUND)
+    (asserts! (is-none existing-emission) ERR_COMPLIANCE_PERIOD_ACTIVE)
+    (asserts! (> emission-amount u0) ERR_INVALID_EMISSION_DATA)
+    
+    (let (
+      (exceeds-limit (> emission-amount u1000))
+      (new-total-emissions (+ (get total-emissions source) emission-amount))
+    )
+      (map-set source-emissions emission-key {
+        emission-amount: emission-amount,
+        emission-type: emission-type,
+        reported-by: tx-sender,
+        report-time: current-block,
+        verified: false,
+        exceeds-limit: exceeds-limit
+      })
+      
+      (map-set pollution-sources source-id (merge source {
+        total-emissions: new-total-emissions,
+        last-report-time: current-block
+      }))
+      
+      (ok true)
+    )
+  )
+)
+
+(define-public (assess-compliance 
+  (source-id uint)
+  (period uint)
+  (is-compliant bool)
+)
+  (let (
+    (source (unwrap! (map-get? pollution-sources source-id) ERR_SOURCE_NOT_FOUND))
+    (emission-key { source-id: source-id, period: period })
+    (emission (unwrap! (map-get? source-emissions emission-key) ERR_INVALID_EMISSION_DATA))
+    (compliance-key { source-id: source-id, period: period })
+    (existing-record (map-get? compliance-records compliance-key))
+    (current-block stacks-block-height)
+  )
+    (asserts! (is-none existing-record) ERR_COMPLIANCE_PERIOD_ACTIVE)
+    (asserts! (get verified emission) ERR_INVALID_EMISSION_DATA)
+    
+    (let (
+      (penalty (if is-compliant u0 (* (get emission-amount emission) EMISSION_PENALTY_RATE)))
+      (reward (if is-compliant COMPLIANCE_REWARD u0))
+      (new-score (if is-compliant 
+                   (if (< (get compliance-score source) u100) 
+                     (+ (get compliance-score source) u5) 
+                     u100)
+                   (if (> (get compliance-score source) u10) 
+                     (- (get compliance-score source) u10) 
+                     u0)))
+    )
+      (map-set compliance-records compliance-key {
+        compliance-status: is-compliant,
+        penalty-amount: penalty,
+        reward-amount: reward,
+        assessment-time: current-block,
+        assessed-by: tx-sender
+      })
+      
+      (map-set pollution-sources source-id (merge source {
+        compliance-score: new-score
+      }))
+      
+      (if is-compliant
+        (try! (as-contract (stx-transfer? reward (get owner source) (get owner source))))
+        (try! (stx-transfer? penalty (get owner source) (as-contract tx-sender)))
+      )
+      
+      (ok is-compliant)
+    )
+  )
+)
+
+(define-public (submit-community-source-report 
+  (source-id uint)
+  (report-type (string-ascii 50))
+  (description (string-ascii 300))
+  (severity uint)
+)
+  (let (
+    (source (unwrap! (map-get? pollution-sources source-id) ERR_SOURCE_NOT_FOUND))
+    (report-id (var-get next-report-id))
+    (current-block stacks-block-height)
+  )
+    (asserts! (get active source) ERR_SOURCE_NOT_FOUND)
+    (asserts! (and (>= severity u1) (<= severity u10)) ERR_INVALID_EMISSION_DATA)
+    (asserts! (>= (len description) u10) ERR_INVALID_EMISSION_DATA)
+    
+    (map-set source-community-reports report-id {
+      source-id: source-id,
+      reporter: tx-sender,
+      report-type: report-type,
+      description: description,
+      severity: severity,
+      report-time: current-block,
+      verified: false,
+      reward-claimed: false
+    })
+    
+    (var-set next-report-id (+ report-id u1))
+    (ok report-id)
+  )
+)
+
+(define-public (verify-community-report (report-id uint) (is-valid bool))
+  (let (
+    (report (unwrap! (map-get? source-community-reports report-id) ERR_REPORT_NOT_FOUND))
+    (source (unwrap! (map-get? pollution-sources (get source-id report)) ERR_SOURCE_NOT_FOUND))
+  )
+    (asserts! (not (get verified report)) ERR_ALREADY_CLAIMED)
+    
+    (map-set source-community-reports report-id (merge report { verified: is-valid }))
+    
+    (if is-valid
+      (let (
+        (new-score (if (> (get compliance-score source) u5) 
+                     (- (get compliance-score source) u5) 
+                     u0))
+      )
+        (map-set pollution-sources (get source-id report) (merge source {
+          compliance-score: new-score
+        }))
+        (ok true)
+      )
+      (ok false)
+    )
+  )
+)
+
+(define-public (claim-community-report-reward (report-id uint))
+  (let (
+    (report (unwrap! (map-get? source-community-reports report-id) ERR_REPORT_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get reporter report)) ERR_NOT_AUTHORIZED)
+    (asserts! (get verified report) ERR_INVALID_EMISSION_DATA)
+    (asserts! (not (get reward-claimed report)) ERR_ALREADY_CLAIMED)
+    
+    (try! (as-contract (stx-transfer? COMMUNITY_REPORT_REWARD tx-sender tx-sender)))
+    (map-set source-community-reports report-id (merge report { reward-claimed: true }))
+    (ok COMMUNITY_REPORT_REWARD)
+  )
+)
+
+(define-public (deactivate-source (source-id uint))
+  (let (
+    (source (unwrap! (map-get? pollution-sources source-id) ERR_SOURCE_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get owner source)) ERR_NOT_AUTHORIZED)
+    (asserts! (get active source) ERR_SOURCE_NOT_FOUND)
+    
+    (map-set pollution-sources source-id (merge source { active: false }))
+    
+    (let (
+      (deposit-refund (if (>= (get compliance-score source) u80) 
+                        (get deposit-amount source) 
+                        (/ (get deposit-amount source) u2)))
+    )
+      (try! (as-contract (stx-transfer? deposit-refund tx-sender tx-sender)))
+      (ok deposit-refund)
+    )
+  )
+)
+
+(define-read-only (get-pollution-source (source-id uint))
+  (map-get? pollution-sources source-id)
+)
+
+(define-read-only (get-source-emissions (source-id uint) (period uint))
+  (map-get? source-emissions { source-id: source-id, period: period })
+)
+
+(define-read-only (get-compliance-record (source-id uint) (period uint))
+  (map-get? compliance-records { source-id: source-id, period: period })
+)
+
+(define-read-only (get-community-source-report (report-id uint))
+  (map-get? source-community-reports report-id)
+)
+
+(define-read-only (get-source-count)
+  (var-get next-source-id)
+)
+
+(define-read-only (is-source-compliant (source-id uint))
+  (match (map-get? pollution-sources source-id)
+    some-source (>= (get compliance-score some-source) u70)
+    false
+  )
+)
+
+
 
