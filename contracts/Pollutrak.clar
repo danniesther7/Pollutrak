@@ -30,6 +30,22 @@
 (define-constant COMPLIANCE_REWARD u750000)
 (define-constant COMMUNITY_REPORT_REWARD u150000)
 
+;; Badge system constants
+(define-constant BADGE_ROOKIE_REPORTER "rookie-reporter")
+(define-constant BADGE_VETERAN_REPORTER "veteran-reporter")
+(define-constant BADGE_TRUSTED_VALIDATOR "trusted-validator")
+(define-constant BADGE_COMMUNITY_CHAMPION "community-champion")
+(define-constant BADGE_ZONE_EXPLORER "zone-explorer")
+(define-constant BADGE_SOURCE_GUARDIAN "source-guardian")
+
+;; Badge thresholds
+(define-constant ROOKIE_THRESHOLD u5)
+(define-constant VETERAN_THRESHOLD u50)
+(define-constant VALIDATOR_THRESHOLD u20)
+(define-constant CHAMPION_REP_THRESHOLD u500)
+(define-constant EXPLORER_ZONE_THRESHOLD u10)
+(define-constant GUARDIAN_SOURCE_THRESHOLD u5)
+
 (define-data-var next-report-id uint u1)
 (define-data-var next-source-id uint u1)
 (define-data-var next-zone-id uint u1)
@@ -115,6 +131,12 @@
 (define-map zone-risk-history
   { zone-id: uint, block-height: uint }
   { risk-level: uint, report-count: uint }
+)
+
+;; Badge system map
+(define-map user-badges
+  principal
+  { badges: (list 20 (string-ascii 20)), zones-created: uint, correct-votes: uint }
 )
 
 (define-public (stake-tokens (amount uint))
@@ -250,6 +272,8 @@
         (begin
           (try! (as-contract (stx-transfer? reward-amount tx-sender tx-sender)))
           (map-set validator-rewards reward-key { amount: reward-amount, claimed: true })
+          (increment-correct-votes tx-sender)
+          (check-and-award-badges tx-sender)
           (ok reward-amount)
         )
         (ok u0)
@@ -268,6 +292,7 @@
     
     (try! (as-contract (stx-transfer? (* REWARD_AMOUNT u2) tx-sender tx-sender)))
     (map-set pollution-reports report-id (merge report { reward-claimed: true }))
+    (check-and-award-badges tx-sender)
     (ok (* REWARD_AMOUNT u2))
   )
 )
@@ -357,6 +382,8 @@
     })
     
     (var-set next-zone-id (+ zone-id u1))
+    (increment-zones-created tx-sender)
+    (check-and-award-badges tx-sender)
     (ok zone-id)
   )
 )
@@ -833,5 +860,109 @@
   )
 )
 
+;; Badge system functions
+(define-private (check-and-award-badges (user principal))
+  (let (
+    (user-rep (get-user-reputation user))
+    (current-badges (default-to { badges: (list), zones-created: u0, correct-votes: u0 }
+                                (map-get? user-badges user)))
+    (user-reports (get total-reports user-rep))
+    (validated-reports (get validated-reports user-rep))
+    (user-score (get score user-rep))
+    (zones-created (get zones-created current-badges))
+    (correct-votes (get correct-votes current-badges))
+    (current-badge-list (get badges current-badges))
+  )
+    (let (
+      (new-badges (award-reporter-badges current-badge-list user-reports validated-reports))
+      (final-badges (award-validator-badges new-badges correct-votes))
+      (champion-badges (award-champion-badge final-badges user-score))
+      (explorer-badges (award-explorer-badge champion-badges zones-created))
+    )
+      (map-set user-badges user (merge current-badges { badges: explorer-badges }))
+    )
+  )
+)
 
+(define-private (award-reporter-badges (current-badges (list 20 (string-ascii 20))) (user-total-reports uint) (user-validated-reports uint))
+  (let (
+    (has-rookie (is-some (index-of current-badges BADGE_ROOKIE_REPORTER)))
+    (has-veteran (is-some (index-of current-badges BADGE_VETERAN_REPORTER)))
+    (rookie-qualified (and (not has-rookie) (>= user-total-reports ROOKIE_THRESHOLD)))
+    (veteran-qualified (and (not has-veteran) (>= user-validated-reports VETERAN_THRESHOLD)))
+  )
+    (if rookie-qualified
+      (let ((with-rookie (unwrap! (as-max-len? (append current-badges BADGE_ROOKIE_REPORTER) u20) current-badges)))
+        (if veteran-qualified
+          (unwrap! (as-max-len? (append with-rookie BADGE_VETERAN_REPORTER) u20) with-rookie)
+          with-rookie
+        )
+      )
+      (if veteran-qualified
+        (unwrap! (as-max-len? (append current-badges BADGE_VETERAN_REPORTER) u20) current-badges)
+        current-badges
+      )
+    )
+  )
+)
 
+(define-private (award-validator-badges (current-badges (list 20 (string-ascii 20))) (correct-votes uint))
+  (let (
+    (has-trusted (is-some (index-of current-badges BADGE_TRUSTED_VALIDATOR)))
+    (trusted-qualified (and (not has-trusted) (>= correct-votes VALIDATOR_THRESHOLD)))
+  )
+    (if trusted-qualified
+      (unwrap! (as-max-len? (append current-badges BADGE_TRUSTED_VALIDATOR) u20) current-badges)
+      current-badges
+    )
+  )
+)
+
+(define-private (award-champion-badge (current-badges (list 20 (string-ascii 20))) (user-score uint))
+  (let (
+    (has-champion (is-some (index-of current-badges BADGE_COMMUNITY_CHAMPION)))
+    (champion-qualified (and (not has-champion) (>= user-score CHAMPION_REP_THRESHOLD)))
+  )
+    (if champion-qualified
+      (unwrap! (as-max-len? (append current-badges BADGE_COMMUNITY_CHAMPION) u20) current-badges)
+      current-badges
+    )
+  )
+)
+
+(define-private (award-explorer-badge (current-badges (list 20 (string-ascii 20))) (zones-created uint))
+  (let (
+    (has-explorer (is-some (index-of current-badges BADGE_ZONE_EXPLORER)))
+    (explorer-qualified (and (not has-explorer) (>= zones-created EXPLORER_ZONE_THRESHOLD)))
+  )
+    (if explorer-qualified
+      (unwrap! (as-max-len? (append current-badges BADGE_ZONE_EXPLORER) u20) current-badges)
+      current-badges
+    )
+  )
+)
+
+(define-private (increment-correct-votes (user principal))
+  (let (
+    (current-badges (default-to { badges: (list), zones-created: u0, correct-votes: u0 }
+                                (map-get? user-badges user)))
+    (new-correct-votes (+ (get correct-votes current-badges) u1))
+  )
+    (map-set user-badges user (merge current-badges { correct-votes: new-correct-votes }))
+  )
+)
+
+(define-private (increment-zones-created (user principal))
+  (let (
+    (current-badges (default-to { badges: (list), zones-created: u0, correct-votes: u0 }
+                                (map-get? user-badges user)))
+    (new-zones-created (+ (get zones-created current-badges) u1))
+  )
+    (map-set user-badges user (merge current-badges { zones-created: new-zones-created }))
+  )
+)
+
+(define-read-only (get-user-badges (user principal))
+  (default-to { badges: (list), zones-created: u0, correct-votes: u0 }
+              (map-get? user-badges user))
+)
